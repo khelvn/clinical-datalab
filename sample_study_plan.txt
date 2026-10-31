@@ -1,0 +1,31 @@
+SAMPLE STUDY (fictional data for testing the lab)
+
+TITLE
+Effect of a 12 week health education programme on blood pressure control among hypertensive adults attending a primary health centre in Lagos
+
+STUDY DESIGN
+Community or field trial
+
+OBJECTIVES (paste one per line)
+To describe the sociodemographic characteristics and blood pressure profile of the participants
+To compare mean systolic blood pressure between the intervention and control groups after 12 weeks
+To determine the change in knowledge score before and after the health education
+To determine the association between education level and blood pressure control
+To identify factors independently associated with blood pressure control
+
+DATA ANALYSIS PLAN (paste as one block)
+Descriptive statistics will be presented as frequencies, percentages, means and standard deviations. Student's t test will be used to compare sbp_followup between group. Student's t test will be used to compare sbp_followup across education levels. Paired t test will be used to compare knowledge_pre and knowledge_post. Chi square test will be used for the association between stroke_history and group. Pearson correlation will be used for age and sbp_baseline. Logistic regression will be used to identify predictors of bp_controlled. The level of significance will be set at 0.05.
+
+WHAT TO EXPECT FROM THE PLAN CHECK
+The plan was written with deliberate weaknesses so you can see the checker work:
+1. Student's t test for education levels (4 groups) should be flagged: ANOVA is better.
+2. Chi square for stroke_history and group should be flagged: expected counts are small, so Fisher's exact test is better.
+3. The plan never mentions checking normality, so a Gap note should appear.
+4. The plan never mentions confidence intervals or effect sizes, so another Gap note should appear.
+
+THINGS TO TRY IN THE LAB
+Step 2: upload hypertension_sample.csv.
+Step 4 (Clean): the file has missing values, 4 duplicate rows, and outliers in bmi and sbp_baseline.
+Step 5: build Table 1 split by group.
+Step 6: choose 'Guided by my study objectives'. The lab goes through your five objectives one by one, suggests the variables, recalls what your plan said, and runs the test. Try the objective about education level and the one about stroke_history too.
+Outliers: in Step 4 the lab only shows them. Capping is optional and hidden under Advanced.
