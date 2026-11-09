@@ -1,5 +1,6 @@
 """Statistics engine for the Clinical DataLab (no Streamlit code here, so it can be tested alone)."""
 import re
+import difflib
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -42,12 +43,15 @@ def iqr_bounds(s):
 
 
 # ---------- cleaning ----------
-def fill_missing(df, col, method):
+def fill_missing(df, col, method, label="Not applicable"):
     df = df.copy()
     n = int(df[col].isna().sum())
     if method == "drop":
         df = df.dropna(subset=[col])
         return df, f"Dropped {n} rows with missing '{col}'."
+    if method == "na":
+        df[col] = df[col].astype(object).fillna(label)
+        return df, f"Labelled {n} blank answers in '{col}' as '{label}' (skip question)."
     val = {"median": lambda s: s.median(), "mean": lambda s: s.mean(), "mode": lambda s: s.mode().iloc[0]}[method](df[col])
     df[col] = df[col].fillna(val)
     return df, f"Filled {n} missing values in '{col}' with {method} ({val if isinstance(val, str) else round(float(val), 2)})."
@@ -258,8 +262,15 @@ def _assoc(df, a, b, alpha, prefer=None):
 
 
 # ---------- Table 1 ----------
+def _levels(s):
+    u = set(s.dropna().unique())
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        return [c for c in s.cat.categories if c in u]
+    return sorted(u, key=str)
+
+
 def table_one(df, group=None, alpha=0.05):
-    levels = sorted(df[group].dropna().unique(), key=str) if group else []
+    levels = _levels(df[group]) if group else []
     rows = []
     for c in df.columns:
         k = classify(df[c], c)
@@ -269,7 +280,7 @@ def table_one(df, group=None, alpha=0.05):
         if group:
             try:
                 r = analyze(df, c, group, False, alpha)
-                pv, tn = fmt_p(r["p"]), r["test"]
+                pv, tn = fmt_p(r["p"]), r["test"] + f" ({r['stat_label']} = {r['stat']:.2f}" + (f", df = {r['df']:g}" if isinstance(r["df"], (int, float, np.floating)) and r["df"] is not None else "") + ")"
             except Exception:
                 pass
         subsets = {"Overall": df} | {str(lv): df[df[group] == lv] for lv in levels}
@@ -279,7 +290,7 @@ def table_one(df, group=None, alpha=0.05):
             rows.append({"Variable": f"{c}, {'mean (SD)' if ok else 'median (IQR)'}", **{n: f(s[c].dropna()) for n, s in subsets.items()}, "p value": pv, "Test": tn})
         else:
             rows.append({"Variable": f"{c}, n (%)", **{n: "" for n in subsets}, "p value": pv, "Test": tn})
-            for lv in sorted(df[c].dropna().unique(), key=str):
+            for lv in _levels(df[c]):
                 rows.append({"Variable": f"   {lv}", **{n: f"{(s[c] == lv).sum()} ({(s[c] == lv).sum() / max(s[c].notna().sum(), 1) * 100:.1f}%)" for n, s in subsets.items()}, "p value": "", "Test": ""})
     return pd.DataFrame(rows)
 
@@ -473,6 +484,9 @@ GENERIC = {
 }
 
 
+SPLIT = re.compile(r"(?<!\d)\.|\.(?!\d)|[\n;]+")
+
+
 def classify_objectives(lines):
     out = []
     for o in [l.strip() for l in lines if l.strip()]:
@@ -485,45 +499,83 @@ def classify_objectives(lines):
     return out
 
 
+FRIENDLY = {"predict": "Finding factors that predict an outcome", "compare": "Comparing groups", "change": "Measuring change over time",
+            "associate": "Finding a relationship between variables", "survival": "Time to an event", "describe": "Describing the participants", "unclear": "Not clear yet"}
+
+
+def _why(planned, rec):
+    rt, r0 = rec["test"].lower(), rec["reasons"][0]
+    m = re.search(r"into (\d+) independent groups", r0)
+    if m and int(m.group(1)) >= 3 and "t test" in planned:
+        return f"A t test compares only two groups, but this variable has {m.group(1)} groups."
+    if "fisher" in rt:
+        return "Some groups are small (fewer than 5 people expected in a cell), so a chi square test would be unreliable."
+    if any(k in rt for k in ("mann whitney", "kruskal", "wilcoxon", "spearman")):
+        return "The values are not bell shaped (Shapiro Wilk test), so a test that does not assume this is safer."
+    if any(k in rt for k in ("t test", "anova", "pearson")):
+        return "The values are roughly bell shaped, so this test is suitable and has more power."
+    return " ".join(rec["reasons"][:2])
+
+
 def check_plan(objectives, plan, df=None, alpha=0.05):
-    import re
     rows, used = [], set()
-    for sent in [s.strip() for s in re.split(r"[\n.;]+", plan) if s.strip()]:
+
+    def add(status, head, why, do, item=None):
+        rows.append({"Item": item or head, "Status": status, "Headline": head, "Why": why, "Do": do, "Advice": f"{why} {do}"})
+
+    for sent in [x.strip() for x in SPLIT.split(plan) if x.strip()]:
         low = sent.lower().replace("-", " ")
         found = [t for t, kws in TESTS.items() if any(k in low for k in kws)]
         if "paired t test" in found and "t test" in found:
             found.remove("t test")
+        if "correlation" in found and ({"pearson", "spearman"} & set(found)):
+            found.remove("correlation")
         if len(found) > 1 and "descriptive" in found:
             found.remove("descriptive")
         cols = [c for c in df.columns if re.search(r"\b" + re.escape(c.lower()) + r"\b", low) or re.search(r"\b" + re.escape(c.lower().replace("_", " ")) + r"\b", low)] if df is not None else []
         for t in found:
             used.add(t)
-            item = f"{t.title()}: {sent[:80]}"
-            if t in KEY and len(cols) >= 2:
+            first = GENERIC[t].split(". ")[0].rstrip(".") + "."
+            if t == "descriptive":
+                add("Appropriate", "Descriptive statistics", first, "Keep it. Describe every variable before you test anything.")
+            elif t in ("logistic regression", "linear regression") and cols:
+                need, label = ("binary", "yes/no") if t == "logistic regression" else ("numeric", "numeric")
+                ok = [c for c in cols if classify(df[c], c) == need]
+                if ok:
+                    add("Appropriate", f"{t.title()} with outcome {ok[0]}", f"'{ok[0]}' is a {label} variable, which is what a {t} needs for its outcome.", "Keep it. Remember about 10 events per predictor.")
+                else:
+                    add("Better option", f"Planned: {t}. The outcome type does not match", f"A {t} needs a {label} outcome, but none of the variables named ({', '.join(cols)}) is {label}.",
+                        "Use logistic regression for a yes/no outcome and linear regression for a measurement.")
+            elif t in KEY and len(cols) >= 2:
                 try:
                     r = analyze(df, cols[0], cols[1], paired=t in ("paired t test", "wilcoxon", "mcnemar"), alpha=alpha)
                     if any(k in r["test"].lower() for k in KEY[t]):
-                        rows.append({"Item": item, "Status": "Appropriate", "Advice": f"For '{cols[0]}' and '{cols[1]}' the data also point to {r['test']}. " + r["reasons"][-1]})
+                        add("Appropriate", f"{t.title()} for {cols[0]} and {cols[1]}", "Your data fit this test. " + first, "Keep it in your plan.")
                     else:
-                        rows.append({"Item": item, "Status": "Better option", "Advice": f"For '{cols[0]}' and '{cols[1]}' the data suggest {r['test']}. Why: " + " ".join(r["reasons"][:3])})
-                    continue
-                except Exception as e:
-                    rows.append({"Item": item, "Status": "Check", "Advice": f"Could not test this pair automatically ({e}). " + GENERIC[t]})
-                    continue
-            rows.append({"Item": item, "Status": "Check", "Advice": GENERIC[t] + ("" if df is not None else " Load your data and name the variables in the plan for a data specific check.")})
+                        add("Better option", f"Planned: {t}. Suggested: {r['test']}", _why(t, r),
+                            f"Use the {r['test']} instead and give the reason in your plan. You can still run your original test in Step 7.")
+                except Exception:
+                    add("Check", f"{t.title()} for {cols[0]} and {cols[1]}", "The lab could not run this pair automatically.", first)
+            else:
+                add("Check", f"{t.title()}: {sent[:70]}", first, "Load your data and name the variables in this sentence so the lab can check it against the real data." if df is None
+                    else "Name two variables from your dataset in this sentence so the lab can check it.")
     for o in classify_objectives(objectives):
         for ty in o["Type"].split(" + "):
             if ty in COVER and not (COVER[ty] & used):
-                rows.append({"Item": f"Objective: {o['Objective'][:80]}", "Status": "Gap", "Advice": f"This is a '{ty}' objective but the plan names no matching test. Consider: {o['Suggested analysis']}."})
+                add("Gap", f"No test in your plan answers: {o['Objective'][:80]}", f"This is a '{FRIENDLY[ty].lower()}' question, and the plan names no test for it.",
+                    f"Add: {o['Suggested analysis']}.", item=f"Objective: {o['Objective'][:80]}")
     low = plan.lower().replace("-", " ")
     if used & {"t test", "paired t test", "anova", "pearson", "linear regression"} and "shapiro" not in low and "normal" not in low:
-        rows.append({"Item": "Normality", "Status": "Gap", "Advice": "The plan uses tests that assume normal data but does not say how normality will be checked. Add the Shapiro Wilk test and a histogram or Q Q plot."})
+        add("Gap", "Say how you will check normality", "Tests such as the t test, ANOVA and Pearson correlation assume the values are roughly bell shaped. Examiners expect you to say how you checked.",
+            "Add a sentence such as: Normality will be checked with the Shapiro Wilk test and histograms.", item="Normality")
     if "confidence" not in low and "effect size" not in low and "odds ratio" not in low:
-        rows.append({"Item": "Reporting", "Status": "Gap", "Advice": "State that 95% confidence intervals and effect sizes (for example odds ratios) will be reported, not only p values."})
+        add("Gap", "Report confidence intervals and effect sizes", "A p value only says whether a result is likely due to chance. A confidence interval and an effect size show how big the difference is.",
+            "Add a sentence such as: 95% confidence intervals and effect sizes (for example odds ratios) will be reported.", item="Reporting")
     if len(used - {"descriptive"}) >= 5:
-        rows.append({"Item": "Many tests", "Status": "Check", "Advice": "With many tests, some will be significant by chance. Say how you will handle multiple comparisons."})
+        add("Check", "Many tests will be run", "Each test has about a 5% chance of a false alarm, so running many tests makes at least one false alarm likely.",
+            "State how you will handle this, for example a stricter p value (Bonferroni) or naming your main outcomes.", item="Many tests")
     if not rows:
-        rows.append({"Item": "Plan", "Status": "Check", "Advice": "No recognised statistical tests were found. Name the tests, for example 'chi square test for association between sex and outcome'."})
+        add("Check", "No statistical tests were recognised", "The lab looks for test names such as chi square, t test or logistic regression.", "Name each test, for example: chi square test for the association between sex and outcome.")
     return pd.DataFrame(rows)
 
 
@@ -532,7 +584,7 @@ STOP = {"the", "and", "between", "among", "with", "after", "before", "determine"
         "independently", "describe", "compare", "participants", "profile", "characteristics", "sociodemographic", "for", "from", "that", "this", "among", "who", "are", "was", "were"}
 SYN = {"sbp": ["systolic", "blood", "pressure"], "dbp": ["diastolic", "blood", "pressure"], "bp": ["blood", "pressure"], "bmi": ["body", "mass", "index", "weight"],
        "hba1c": ["glycated", "haemoglobin", "glucose"], "fbs": ["fasting", "glucose"], "los": ["length", "stay"], "hb": ["haemoglobin", "anaemia"], "htn": ["hypertension"], "dm": ["diabetes"]}
-PRE = {"pre", "before", "baseline", "initial"}
+PRE = {"pre", "preop", "before", "baseline", "initial"}
 POST = {"post", "after", "followup", "follow", "final", "endline"}
 PLAN_PREF = {"t test": "parametric", "paired t test": "parametric", "anova": "parametric", "pearson": "parametric", "mann whitney": "nonparametric",
              "wilcoxon": "nonparametric", "kruskal": "nonparametric", "spearman": "nonparametric", "fisher": "exact", "chi square": "chisquare"}
@@ -576,8 +628,14 @@ def suggest(objective, df):
             sc += (post and bool(set(ct) & POST)) + (pre and bool(set(ct) & PRE))
             score[c] = sc
     nums = [c for c in df.columns if classify(df[c], c) == "numeric"]
-    pairs = [(a, b) for a in nums for b in nums if set(_toks(a)) & PRE and set(_toks(b)) & POST
-             and [x for x in _toks(a) if x not in PRE] == [x for x in _toks(b) if x not in POST]]
+    def is_post(ts):
+        return any(x in POST or re.fullmatch(r"\d+(m|w|d)(po)?|postop", x) for x in ts)
+
+    def core(ts):
+        return " ".join(x for x in ts if x not in PRE and x not in POST and not re.fullmatch(r"\d+(m|w|d)(po)?|postop", x))
+
+    pairs = [(a, b) for a in nums for b in nums if set(_toks(a)) & PRE and is_post(_toks(b))
+             and difflib.SequenceMatcher(None, core(_toks(a)), core(_toks(b))).ratio() >= 0.75]
     pairs.sort(key=lambda p: -(score.get(p[0], 0) + score.get(p[1], 0)))
     return {"matched": sorted(score, key=lambda c: -score[c]), "pairs": pairs}
 
@@ -585,7 +643,7 @@ def suggest(objective, df):
 def planned_tests(plan, cols=(), ty=None):
     """Tests named in the proposal's analysis plan for sentences that mention the chosen variables."""
     out = []
-    for sent in re.split(r"[\n.;]+", plan):
+    for sent in SPLIT.split(plan):
         low = sent.lower().replace("-", " ")
         found = [t for t, kws in TESTS.items() if any(k in low for k in kws)]
         if "paired t test" in found and "t test" in found:
@@ -595,3 +653,427 @@ def planned_tests(plan, cols=(), ty=None):
         if found and cols and all(re.search(r"\b" + re.escape(c.lower()) + r"\b", low) for c in cols):
             out += [t for t in found if t not in out]
     return out
+
+
+# ---------- real world data preparation ----------
+def skip_parent(df, col):
+    """Detect a skip question: blanks in `col` sit almost entirely under one answer of another question."""
+    miss = df[col].isna()
+    if miss.sum() < 3:
+        return None
+    best = None
+    for p in df.columns:
+        if p == col or classify(df[p], p) not in ("binary", "categorical"):
+            continue
+        ok = df[p].notna()
+        for lv in df[p].dropna().unique():
+            sel = df[p] == lv
+            if sel.sum() < 3:
+                continue
+            share = (miss & sel).sum() / miss.sum()
+            other = (miss & ~sel & ok).sum() / max((~sel & ok).sum(), 1)
+            within = (miss & sel).sum() / sel.sum()
+            if share >= 0.9 and other <= 0.05 and within >= 0.8 and (best is None or share > best[2]):
+                best = (p, lv, float(share))
+    return best
+
+
+def categorise(s, cuts):
+    cuts = sorted({float(c) for c in cuts})
+    x = pd.to_numeric(s, errors="coerce")
+    ints = bool(x.dropna().mod(1).eq(0).all()) and all(c == int(c) for c in cuts)
+    f = (lambda v: str(int(v))) if ints else (lambda v: f"{v:g}")
+    labels = [f"Under {f(cuts[0])}"] + [f"{f(a)} to {f(b - 1)}" if ints else f"{f(a)} to under {f(b)}" for a, b in zip(cuts, cuts[1:])] + [f"{f(cuts[-1])} and above"]
+    return pd.cut(x, [-np.inf] + cuts + [np.inf], labels=labels, right=False, ordered=True)
+
+
+def suggest_cuts(s, method, n=4):
+    x = pd.to_numeric(s, errors="coerce").dropna()
+    if method == "quartiles":
+        return [round(v) for v in x.quantile([.25, .5, .75])]
+    return [round(v) for v in np.linspace(x.min(), x.max(), n + 1)[1:-1]]
+
+
+def make_codes(cols, scheme, kap=None):
+    used, out, cnt = set(), [], {"K": 0, "A": 0, "P": 0}
+    for n, c in enumerate(cols, 1):
+        if scheme == "short":
+            w = [x for x in re.findall(r"[a-z0-9]+", str(c).lower()) if x not in STOP][:4]
+            code = "_".join(w) or f"q{n}"
+        elif scheme == "kap" and kap and kap.get(c) in ("Knowledge", "Attitude", "Practice"):
+            l = kap[c][0]
+            cnt[l] += 1
+            code = f"{l}{cnt[l]}"
+        else:
+            code = f"Q{n}"
+        base, k = code, 2
+        while code in used:
+            code, k = f"{base}_{k}", k + 1
+        used.add(code)
+        out.append(code)
+    return out
+
+
+KAP_WORDS = {
+    "Knowledge": ["know", "aware", "heard", "cause", "symptom", "sign", "risk factor", "transmit", "spread", "prevent", "true or false", "which of", "defin", "complication", "cure"],
+    "Attitude": ["agree", "disagree", "believe", "feel", "think", "opinion", "should", "willing", "comfortable", "important", "afraid", "fear", "likely", "support", "worried", "ashamed", "attitude"],
+    "Practice": ["have you", "do you", "did you", "was the", "were you", "how often", "how many times", "practice", "usually", "regularly", "in the last", "ever been", "wash", "screened", "tested", "visited", "attend", "exercise", "checked"]}
+LIKMAP = {"sd": 1, "d": 2, "n": 3, "a": 4, "sa": 5, "strongly disagree": 1, "disagree": 2, "neutral": 3, "undecided": 3, "not sure": 3, "agree": 4, "strongly agree": 5}
+
+
+def detect_kap(df):
+    rows = []
+    for c in df.columns:
+        if classify(df[c], c) not in ("binary", "categorical"):
+            continue
+        low = str(c).lower()
+        vals = {str(v).strip().lower() for v in df[c].dropna().unique()}
+        sc = {d: sum(w in low for w in ws) for d, ws in KAP_WORDS.items()}
+        lik = len(vals & set(LIKMAP)) >= 3
+        if lik:
+            sc["Attitude"] += 3
+        elif vals & {"i don't know", "i dont know", "don't know", "dont know", "not sure"}:
+            sc["Knowledge"] += 3
+        if "true or false" in low or vals <= {"true", "false"}:
+            sc["Knowledge"] += 1
+        best = max(sc, key=sc.get)
+        demo = any(re.search(r"\b" + w + r"\b", low) for w in ("sex", "gender", "age", "education", "marital", "religion", "occupation", "income", "ethnic", "tribe"))
+        rows.append({"Column": c, "Section": best if sc[best] > (1 if demo else 0) else "Other", "_v": frozenset(vals)})
+    for _ in range(2):  # questionnaires come in blocks: a neighbour with the same answer set shares the section
+        for n, r in enumerate(rows):
+            if r["Section"] == "Other":
+                for nb in (rows[n + 1] if n + 1 < len(rows) else None, rows[n - 1] if n else None):
+                    if nb and nb["Section"] != "Other" and nb["_v"] == r["_v"] and len(r["_v"]) >= 2:
+                        r["Section"] = nb["Section"]
+                        break
+    for n, r in enumerate(rows):  # fill gaps between matching neighbours
+        if r["Section"] == "Other":
+            prev = next((x["Section"] for x in reversed(rows[:n]) if x["Section"] != "Other"), None)
+            nxt = next((x["Section"] for x in rows[n + 1:] if x["Section"] != "Other"), None)
+            if prev and prev == nxt:
+                r["Section"] = prev
+    return pd.DataFrame(rows, columns=["Column", "Section"])
+
+
+def kap_score(df, items, domain, cutoff="Median"):
+    """items: {column: {"correct": answer, "reverse": bool}}. Returns percentage score, level, cutoff used."""
+    pts, mx = [], []
+    for c, o in items.items():
+        s = df[c].astype(object).where(df[c].notna()).map(lambda v: str(v).strip().lower() if pd.notna(v) else np.nan)
+        if domain == "Attitude" and s.notna().any() and set(s.dropna().unique()) <= set(LIKMAP):
+            p = s.map(LIKMAP).astype(float)
+            p = 6 - p if o.get("reverse") else p
+            m = 5.0
+        else:
+            p = (s == str(o.get("correct", "")).strip().lower()).astype(float).where(s.notna())
+            m = 1.0
+        pts.append(p)
+        mx.append(m)
+    P = pd.concat(pts, axis=1)
+    ans = P.notna()
+    pct = P.fillna(0).sum(axis=1) / (ans * np.array(mx)).sum(axis=1).replace(0, np.nan) * 100
+    pct[ans.mean(axis=1) < 0.8] = np.nan
+    cut = {"Median": pct.median(), "Mean": pct.mean()}.get(cutoff, None)
+    if cut is None:
+        cut = float(cutoff.split("%")[0])
+    hi, lo = ("Positive", "Negative") if domain == "Attitude" else ("Good", "Poor")
+    level = pd.Series(np.where(pct >= cut, hi, lo), index=df.index).where(pct.notna())
+    return pct.round(1), level, float(cut)
+
+
+def review_rows(df, rows, alpha=0.05):
+    """Compare a user's earlier tests with what the lab recommends."""
+    out = []
+    for r in rows:
+        v1, v2, used, p_user, paired = r.get("v1"), r.get("v2"), r.get("test"), r.get("p"), bool(r.get("paired"))
+        op = r.get("op", "=")
+        if not v1 or not v2 or not used or v1 not in df.columns or v2 not in df.columns:
+            continue
+        item = {"Variables": f"{v1} and {v2}", "Test you used": used}
+        try:
+            rec = analyze(df, v1, v2, paired, alpha)
+        except Exception as e:
+            out.append({**item, "Verdict": "Could not check", "Lab recommends": "", "Advice": str(e)})
+            continue
+        match = any(k in rec["test"].lower() for k in KEY.get(used, [used]))
+        item.update({"Lab recommends": rec["test"], "Lab p value (recommended)": round(float(rec["p"]), 4)})
+        advice = []
+        pref = PLAN_PREF.get(used)
+        try:
+            mine = analyze(df, v1, v2, paired, alpha, pref) if pref else rec
+            if match or any(k in mine["test"].lower() for k in KEY.get(used, [used])):
+                item["Lab p value (your test)"] = round(float(mine["p"]), 4)
+                if p_user not in (None, "") and not pd.isna(p_user):
+                    gap = abs(float(p_user) - float(mine["p"]))
+                    same = (float(mine["p"]) < float(p_user)) if op == "<" else (gap <= max(0.005, 0.1 * float(mine["p"])))
+                    advice.append("The reported p value matches the lab's." if same else
+                                  f"The reported p value ({float(p_user):.3f}) differs from the lab's ({float(mine['p']):.3f}) for the same test. Ask which rows were included and how missing values were handled.")
+            else:
+                advice.append(f"A {used} cannot be run on these variables the way it was described.")
+        except Exception:
+            pass
+        item["Verdict"] = "Appropriate" if match else "Better option"
+        if not match:
+            advice.insert(0, "Why the lab suggests a different test: " + " ".join(rec["reasons"][:3]))
+        if rec["significant"] != (p_user not in (None, "") and not pd.isna(p_user) and float(p_user) < alpha) and p_user not in (None, "") and not pd.isna(p_user):
+            advice.append("The conclusion (significant or not) differs between your result and the recommended test.")
+        item["Advice"] = " ".join(advice)
+        out.append(item)
+    return pd.DataFrame(out)
+
+
+# ---------- KAP scoring system (uploaded or edited in the lab) ----------
+NEG_CUES = ["no need", "not necessary", "okay to", "ok to", "should be able to", "need to keep", "i should start", "i should take", "rather", "skipping",
+            "safe drug", "go to another", "ashamed", "can continue", "does not matter"]
+
+
+def kap_template(df, kap, attitude_mode="scale"):
+    """One row per item and answer, with starting points the user must check. Grid items ([option] columns) share a Group."""
+    rows, pre = [], {}
+    for c in kap:
+        if str(c).rstrip().endswith("]") and "[" in str(c):
+            pre.setdefault(str(c)[:str(c).rindex("[")].strip(), []).append(c)
+    gid = {c: k for k, v in pre.items() if len(v) >= 2 for c in v}
+    for c, sec in kap.items():
+        if sec not in ("Knowledge", "Attitude", "Practice") or c not in df.columns:
+            continue
+        levels = sorted(df[c].dropna().astype(str).str.strip().unique(), key=str)
+        lik = len({l.lower() for l in levels} & set(LIKMAP)) >= 3
+        neg = any(k in str(c).lower() for k in NEG_CUES)
+        for l in levels:
+            ll = l.lower()
+            if sec == "Attitude" and lik:
+                if attitude_mode == "dichotomised":
+                    pts = int(ll in (("sd", "d", "strongly disagree", "disagree") if neg else ("sa", "a", "strongly agree", "agree")))
+                else:
+                    pts = LIKMAP.get(ll, 0)
+            else:
+                pts = 1 if ll in ("yes", "true", "correct") else 0
+            rows.append({"Item": c, "Domain": sec, "Answer": l, "Points": pts, "Group": gid.get(c, "")})
+    return pd.DataFrame(rows, columns=["Item", "Domain", "Answer", "Points", "Group"])
+
+
+def match_item(item, cols, codebook=None):
+    norm = lambda x: re.sub(r"\s+", " ", str(x).strip().lower())
+    cmap = {norm(c): c for c in cols}
+    for code, q in (codebook or {}).items():
+        if code in cols:
+            cmap.setdefault(norm(q), code)
+    k = norm(item)
+    if k in cmap:
+        return cmap[k]
+    m = difflib.get_close_matches(k, list(cmap), n=1, cutoff=0.85)
+    return cmap[m[0]] if m else None
+
+
+def score_system(df, table, codebook=None, missing_as_zero=True):
+    """Sum the points of every item in each domain. Items sharing a Group (a tick all that apply grid) earn the group's points only if every item is answered correctly."""
+    t = table.copy()
+    t["col"] = t["Item"].map(lambda i: match_item(i, list(df.columns), codebook))
+    unmatched = sorted(t.loc[t["col"].isna(), "Item"].astype(str).unique())
+    t = t.dropna(subset=["col"])
+    t["Points"] = pd.to_numeric(t["Points"], errors="coerce").fillna(0)
+    if "Domain" not in t:
+        t["Domain"] = "Score"
+    if "Group" not in t:
+        t["Group"] = ""
+    t["Domain"], t["Group"] = t["Domain"].fillna("Score").astype(str), t["Group"].fillna("").astype(str)
+    out = {}
+    for dom, g in t.groupby("Domain"):
+        pts, mx = [], 0.0
+        def answered(c, gi):
+            mp = {str(a).strip().lower(): float(p) for a, p in zip(gi["Answer"], gi["Points"])}
+            s_ = df[c].map(lambda v: str(v).strip().lower() if pd.notna(v) else np.nan)
+            return s_, mp
+        for c, gi in g[g["Group"] == ""].groupby("col"):
+            s_, mp = answered(c, gi)
+            p = s_.map(mp)
+            pts.append(p.where(~(s_.notna() & p.isna()), 0.0))
+            mx += max(mp.values())
+        for gname, gg in g[g["Group"] != ""].groupby("Group"):
+            oks = []
+            for c, gi in gg.groupby("col"):
+                s_, mp = answered(c, gi)
+                p = s_.map(mp).where(s_.notna()).fillna(-1) if False else s_.map(mp)
+                oks.append((p.where(~(s_.notna() & p.isna()), 0.0) > 0).astype(float).where(s_.notna()))
+            top = gg["Points"].max()
+            pts.append(pd.concat(oks, axis=1).min(axis=1, skipna=False) * top)
+            mx += top
+        P = pd.concat(pts, axis=1)
+        raw = P.fillna(0).sum(axis=1) if missing_as_zero else P.sum(axis=1).where(P.notna().all(axis=1))
+        raw = raw.where(P.notna().any(axis=1))
+        out[dom] = (raw, raw / mx * 100 if mx else raw * np.nan, mx, P.shape[1])
+    return out, unmatched
+
+
+def assign_levels(score, cats):
+    """cats: DataFrame with Category and Minimum. A person gets the highest category whose minimum they reach."""
+    c = cats.dropna().sort_values("Minimum")
+    mins, labs = c["Minimum"].astype(float).values, c["Category"].astype(str).values
+    idx = np.searchsorted(mins, score.values.astype(float), side="right") - 1
+    vals = [labs[i] if (i >= 0 and pd.notna(v)) else None for i, v in zip(idx, score.values)]
+    return pd.Categorical(vals, categories=list(labs), ordered=True)
+
+
+PVAL = re.compile(r"\bp\s*(?:value)?\s*(<|=|>|\u2264|\u2265)?\s*(0?\.\d+|\d(?:\.\d+)?(?:e-\d+)?)", re.I)
+
+
+def review_text(df, text, alpha=0.05, codebook=None):
+    """Read an analyst's methods and results text, find each test, the variables and the p value, and check them."""
+    rows, loose, notes = [], [], []
+    names = {c: [c.lower(), c.lower().replace("_", " ")] + ([str(codebook[c]).lower()] if codebook and c in codebook else []) for c in df.columns}
+    for sent in [x.strip() for x in SPLIT.split(text) if x.strip()]:
+        low = sent.lower().replace("-", " ")
+        found = [t for t, kws in TESTS.items() if t != "descriptive" and any(k in low for k in kws)]
+        if "paired t test" in found and "t test" in found:
+            found.remove("t test")
+        if "correlation" in found and ({"pearson", "spearman"} & set(found)):
+            found.remove("correlation")
+        if not found:
+            continue
+        cols = [c for c, ns in names.items() if any(re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", low) for n in ns if n)]
+        m = PVAL.search(sent)
+        p, op = (float(m.group(2)), "<" if m.group(1) == "<" else "=") if m else (None, "=")
+        for t in found:
+            if t in ("logistic regression", "linear regression"):
+                kinds = [classify(df[c], c) for c in cols]
+                need, label = ("binary", "yes/no") if t == "logistic regression" else ("numeric", "numeric")
+                ok = need in kinds
+                rows.append({"Variables": ", ".join(cols) or "not found", "Test you used": t, "Verdict": ("Appropriate" if ok else "Better option") if cols else "Could not check",
+                             "Lab recommends": "", "Advice": (f"The model needs a {label} outcome and one of the named variables is {label}." if ok else
+                              (f"A {t} needs a {label} outcome, but none of the variables named is {label}. Check which variable is the outcome." if cols else "No variable from your data was found in this sentence.")) + " " + GENERIC[t]})
+            elif len(cols) >= 2 and t in KEY:
+                rows.append({"v1": cols[0], "v2": cols[1], "test": t, "p": p, "op": op, "paired": t in ("paired t test", "wilcoxon", "mcnemar") or "before and after" in low})
+            else:
+                loose.append(sent[:140])
+    chk = review_rows(df, [r for r in rows if "v1" in r], alpha)
+    extra = pd.DataFrame([r for r in rows if "v1" not in r], columns=["Variables", "Test you used", "Verdict", "Lab recommends", "Advice"])
+    out = pd.concat([chk, extra], ignore_index=True) if len(extra) else chk
+    g = check_plan([], text, None, alpha)
+    notes = [r["Headline"] + ": " + r["Why"] for _, r in g.iterrows() if r["Item"] in ("Normality", "Reporting", "Many tests")]
+    return out, loose, notes
+
+
+# ---------- repeated measurements, within group analysis, numbers stored as text ----------
+TIME_RE = re.compile(r"^\s*(preop|preoperative|baseline|pre|\d+\s*(?:m|w|d)(?:po)?|\d+\s*(?:month|week|day)s?)\b[\s_:.\-]*", re.I)
+
+
+def time_families(df):
+    """Find measurements repeated over time from column prefixes such as PREOP, 3MPO, 6MPO. Returns {parameter: {time label: column}}."""
+    parts = {}
+    for c in df.columns:
+        m = TIME_RE.match(str(c))
+        if m and classify(df[c], c) == "numeric":
+            parts.setdefault(m.group(1).lower().replace(" ", ""), {})[c] = re.sub(r"[^a-z0-9]+", " ", str(c)[m.end():].lower()).strip()
+    if len(parts) < 2:
+        return {}
+    base_names = ("preop", "preoperative", "baseline", "pre")
+    keys = sorted(parts, key=lambda k: (0 if k in base_names else 1, int(re.match(r"\d+", k).group()) if re.match(r"\d+", k) else 0))
+    fams = {}
+    for bc, bname in parts[keys[0]].items():
+        fam = {keys[0]: bc}
+        for k in keys[1:]:
+            best = max(parts[k].items(), key=lambda kv: difflib.SequenceMatcher(None, bname, kv[1]).ratio(), default=None)
+            if best and difflib.SequenceMatcher(None, bname, best[1]).ratio() >= 0.6:
+                fam[k] = best[0]
+        if len(fam) >= 2:
+            fams[bname] = fam
+    return fams
+
+
+def _order(s):
+    return _levels(s) if isinstance(s.dtype, pd.CategoricalDtype) else list(pd.unique(s.dropna()))
+
+
+def _spread(x, center):
+    x = pd.Series(x).dropna()
+    if not len(x):
+        return ""
+    return f"{x.median():.2f} ({x.quantile(.25):.2f} to {x.quantile(.75):.2f})" if center == "median" else f"{x.mean():.2f} ({x.std():.2f})"
+
+
+def repeated_table(df, group, fams, alpha=0.05, prefer=None, center="median"):
+    """Dissertation style table: each parameter by group at every time point, within group p (versus baseline) and between group p at each time point."""
+    levels = _order(df[group])
+    rows = []
+    for fam, cols in fams.items():
+        times = list(cols)
+        for gi, lv in enumerate(levels):
+            sub = df[df[group] == lv]
+            row = {"Parameter": fam if gi == 0 else "", "Group": str(lv)}
+            for k in times:
+                row[f"{k} {center}"] = _spread(sub[cols[k]], center)
+            for k in times[1:]:
+                try:
+                    row[f"p {times[0]} vs {k}"] = round(float(analyze(sub, cols[times[0]], cols[k], True, alpha, prefer)["p"]), 4)
+                except Exception:
+                    row[f"p {times[0]} vs {k}"] = None
+            for k in times:
+                try:
+                    row[f"p between groups at {k}"] = round(float(analyze(df, cols[k], group, False, alpha, prefer)["p"]), 4) if gi == 0 else None
+                except Exception:
+                    row[f"p between groups at {k}"] = None
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def by_group(df, a, b, paired, by, alpha=0.05, prefer=None):
+    """Run the same test separately within each level of another variable."""
+    rows = []
+    for lv in _order(df[by]):
+        sub = df[df[by] == lv]
+        try:
+            r = analyze(sub, a, b, paired, alpha, prefer)
+            rows.append({by: str(lv), "n": len(sub), "Test": r["test"], "Statistic": f"{r['stat_label']} = {r['stat']:.2f}", "p value": round(float(r["p"]), 4), "Significant": "Yes" if r["significant"] else "No"})
+        except Exception as e:
+            rows.append({by: str(lv), "n": len(sub), "Test": "could not run", "Statistic": "", "p value": None, "Significant": str(e)[:60]})
+    return pd.DataFrame(rows)
+
+
+def numeric_like(df, share=0.8):
+    """Text columns where most entries are numbers (for example a few entries typed as text)."""
+    out = []
+    for c in df.columns:
+        if df[c].dtype == object or str(df[c].dtype) in ("str", "string"):
+            x = df[c].dropna()
+            n = pd.to_numeric(x, errors="coerce")
+            if len(x) and n.notna().mean() >= share and n.notna().mean() < 1:
+                out.append(c)
+    return out
+
+
+# ---------- privacy check ----------
+ID_WORDS = ["name", "phone", "mobile", "tel", "email", "e mail", "address", "hospital number", "hospital no", "folder", "dob", "date of birth", "birth date",
+            "matric", "nin", "bvn", "signature", "initials", "timestamp"]
+
+
+def identifier_check(df):
+    """Flag columns that may identify a person: names, contacts, exact entry times, free text that is unique for almost every row."""
+    rows = []
+    for c in df.columns:
+        low = str(c).lower().replace("_", " ")
+        why = []
+        if any(re.search(r"\b" + re.escape(w) + r"\b", low) for w in ID_WORDS):
+            why.append("the column name suggests an identifier")
+        s = df[c].dropna()
+        if pd.api.types.is_datetime64_any_dtype(df[c]) and len(s) and (s.dt.hour.nunique() > 1 or s.dt.minute.nunique() > 1):
+            why.append("exact date and time of each entry")
+        elif (df[c].dtype == object or str(df[c].dtype) in ("str", "string")) and len(s):
+            v = s.astype(str)
+            if v.str.contains(r"@[\w.]+\.\w+|(?:\+?234|0)[789][01]\d{8}\b").any():
+                why.append("contains email addresses or phone numbers")
+            elif len(s) > 20 and v.nunique() / len(s) > 0.9 and v.str.len().mean() > 6:
+                why.append("free text that is different in almost every row")
+        if why:
+            rows.append({"Column": c, "Concern": "; ".join(why)})
+    return pd.DataFrame(rows, columns=["Column", "Concern"])
+
+
+def rare_groups(df, min_n=3):
+    """Answers given by only a few people, which can make someone recognisable in a small sample."""
+    rows = []
+    for c in df.columns:
+        if classify(df[c], c) in ("binary", "categorical"):
+            vc = df[c].value_counts()
+            rows += [{"Column": c, "Answer": str(k), "People": int(n)} for k, n in vc.items() if n <= min_n]
+    return pd.DataFrame(rows, columns=["Column", "Answer", "People"])
