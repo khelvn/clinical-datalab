@@ -7,6 +7,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import stats_engine as se
 
+if getattr(se, "ENGINE_VERSION", None) != "2026-11-10":
+    st.error("The file stats_engine.py is out of date. Replace it with the latest stats_engine.py from the same download as app.py (both files must always be updated together), then reboot the app.")
+    st.stop()
+
 st.set_page_config(page_title="Clinical DataLab", page_icon="🩺", layout="centered")
 st.markdown("<style>h1,h2,h3{color:#0b2a5b} .stButton>button{background:#c8102e;color:white;border:0;border-radius:8px}</style>",
             unsafe_allow_html=True)
@@ -448,7 +452,7 @@ elif i == 1:
 
 # ---------------- 2 Explore ----------------
 elif i == 2:
-    t1, t2, t3, t4 = st.tabs(["Column codes", "Create categories", "KAP scoring", "Number columns"])
+    t1, t2, t3, t4, t5 = st.tabs(["Column codes", "Create categories", "KAP scoring", "Number columns", "Combine categories"])
     with t1:
         st.info("**What to do:** replace long questionnaire headings with short codes. The original questions stay in a codebook and appear next to each code when you pick variables.")
         scheme = st.radio("Coding style", ["Q1, Q2, Q3 (simple)", "Short names from the first words of each question", "KAP codes (K1, A1, P1) and Q for the rest"], key="scheme")
@@ -539,8 +543,8 @@ elif i == 2:
                     sc = pct if pct_mode else raw
                     st.markdown(f"**{dom}**: {ni} items, maximum {mx:g} points, mean {raw.mean():.1f} points ({pct.mean():.1f}%).")
                     dflt = pd.DataFrame({"Category": ["Poor", "Good"], "Minimum": [0.0, 50.0 if pct_mode else round(mx / 2, 1)]})
-                    cats = st.data_editor(dflt, num_rows="dynamic", hide_index=True, key=f"cats{dom}{pct_mode}")
-                    lv = pd.Series(se.assign_levels(sc, cats), index=df.index)
+                    cat_tbl = st.data_editor(dflt, num_rows="dynamic", hide_index=True, key=f"cats{dom}{pct_mode}")
+                    lv = pd.Series(se.assign_levels(sc, cat_tbl), index=df.index)
                     cnt = lv.value_counts(sort=False)
                     st.dataframe(pd.DataFrame({"n": cnt, "%": (cnt / max(cnt.sum(), 1) * 100).round(1)}))
                     outs[dom] = (raw, pct, lv)
@@ -568,6 +572,30 @@ elif i == 2:
                     d2[c] = pd.to_numeric(d2[c], errors="coerce")
                     lines.append(f"Converted '{c}' to numbers ({bad} non numeric entries became blank).")
                 st.session_state.update(df=d2, flash=f"Converted {len(pn)} columns.", log=st.session_state.log + lines)
+                st.rerun()
+    with t5:
+        st.info("**What to do:** merge small or similar answers into one group, for example Ijaw and Urhobo into Other tribes. This makes tests such as chi square more reliable. Your original column is kept.")
+        if not cats:
+            st.write("There are no categorical variables.")
+        else:
+            c = st.selectbox("Variable to regroup", cats, format_func=fmt, key="combv")
+            tgt = st.text_input("Name of the grouped column", f"{c}_grouped", key=f"combn{c}")
+            work = df[tgt] if tgt in df.columns else df[c]
+            cnt = work.value_counts()
+            st.dataframe(pd.DataFrame({"People": cnt, "%": (cnt / cnt.sum() * 100).round(1)}))
+            st.caption("Groups with fewer than 5 people make chi square tests unreliable. You can combine several times; each step builds on the grouped column.")
+            pick = st.multiselect("Answers to combine", list(cnt.index), key=f"combp{c}{len(cnt)}")
+            lab = st.text_input("Label for the combined group", "Other", key=f"combl{c}{len(cnt)}")
+            b1, b2 = st.columns(2)
+            if len(pick) >= 2 and b1.button("Combine selected answers"):
+                d2 = df.copy()
+                base = d2[tgt] if tgt in d2.columns else d2[c]
+                d2[tgt] = base.astype(object).where(~base.isin(pick), lab)
+                st.session_state.update(df=d2, flash=f"Combined {len(pick)} answers into '{lab}' in '{tgt}'.",
+                                        log=st.session_state.log + [f"In '{tgt}' (from '{c}'), combined {', '.join(map(str, pick))} into '{lab}'."])
+                st.rerun()
+            if tgt in df.columns and b2.button("Delete grouped column"):
+                st.session_state.update(df=df.drop(columns=[tgt]), flash=f"Deleted '{tgt}'.", log=st.session_state.log + [f"Deleted grouped column '{tgt}'."])
                 st.rerun()
     next_btn(i)
 
